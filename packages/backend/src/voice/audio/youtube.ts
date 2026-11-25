@@ -50,6 +50,23 @@ export function getCookieArgs(): string[] {
   return args;
 }
 
+function extractYtDlpError(context: string, code: number | null, stderr: string): string {
+  const trimmed = stderr.trim();
+  console.error(
+    trimmed
+      ? `[yt-dlp] ${context} failed (code ${code}):\n${trimmed}`
+      : `[yt-dlp] ${context} failed (code ${code})`,
+  );
+
+  const errorLines = stderr
+    .split(/\r?\n/)
+    .filter((line) => line.includes("ERROR:"))
+    .join(" ")
+    .trim();
+  const detail = errorLines || trimmed.slice(-250);
+  return detail.slice(0, 250);
+}
+
 function fetchYouTubeInfo(url: string, spawnFn: typeof spawn): Promise<YouTubeInfo> {
   return new Promise((resolve, reject) => {
     const infoProc = spawnFn(
@@ -69,7 +86,8 @@ function fetchYouTubeInfo(url: string, spawnFn: typeof spawn): Promise<YouTubeIn
 
     infoProc.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(`yt-dlp info failed (code ${code}): ${infoErr.slice(0, 200)}`));
+        const detail = extractYtDlpError("info", code, infoErr);
+        return reject(new Error(`yt-dlp info failed (code ${code}): ${detail}`));
       }
 
       const firstLine = infoJson
@@ -134,7 +152,8 @@ function runYtDlpDownload(url: string, tempDir: string, spawnFn: typeof spawn): 
 
     dlProc.on("close", (dlCode) => {
       if (dlCode !== 0) {
-        return reject(new Error(`yt-dlp download failed (code ${dlCode}): ${dlErr.slice(0, 200)}`));
+        const detail = extractYtDlpError("download", dlCode, dlErr);
+        return reject(new Error(`yt-dlp download failed (code ${dlCode}): ${detail}`));
       }
       resolve();
     });
@@ -331,7 +350,8 @@ export function getYouTubeUrlInfo(url: string): Promise<{ type: 'video' | 'playl
 
     proc.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(`yt-dlp info failed (code ${code}): ${stderr.slice(0, 200)}`));
+        const detail = extractYtDlpError("url info", code, stderr);
+        return reject(new Error(`yt-dlp info failed (code ${code}): ${detail}`));
       }
 
       try {
@@ -384,7 +404,8 @@ export function searchYouTube(query: string, maxResults: number = 10): Promise<Y
 
     proc.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(`yt-dlp search failed (code ${code}): ${stderr.slice(0, 200)}`));
+        const detail = extractYtDlpError("search", code, stderr);
+        return reject(new Error(`yt-dlp search failed (code ${code}): ${detail}`));
       }
 
       try {

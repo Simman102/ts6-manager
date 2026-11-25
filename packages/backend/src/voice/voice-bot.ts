@@ -29,12 +29,18 @@ function runYtDlpResolve(cleanUrl: string, formatFilter: string, extraArgs: stri
 
     proc.on('close', (code) => {
       if (code !== 0) {
+        const trimmedErr = stderr.trim();
+        console.error(
+          trimmedErr
+            ? `[yt-dlp] resolve failed (code ${code}):\n${trimmedErr}`
+            : `[yt-dlp] resolve failed (code ${code})`,
+        );
         const errorLines = stderr
           .split(/\r?\n/)
           .filter((line) => line.includes('ERROR:'))
           .join(' ')
           .trim();
-        const detail = errorLines || stderr.trim().slice(-250);
+        const detail = errorLines || trimmedErr.slice(-250);
         return reject(new Error(`yt-dlp failed (code ${code}): ${detail.slice(0, 250)}`));
       }
       // yt-dlp -g returns the direct URL(s), take the first one
