@@ -23,14 +23,6 @@ import (
 )
 
 var defaultStunServers = []string{
-	"stun:49.13.204.141:3478",
-	"stun:176.58.93.154:3478",
-	"stun:185.40.234.113:3478",
-	"stun:68.183.90.120:3478",
-	"stun:45.159.97.233:3478",
-	"stun:172.105.166.103:3478",
-	"stun:172.237.28.183:3478",
-	"stun:208.72.155.133:3478",
 	"stun:stun.l.google.com:19302",
 }
 
@@ -235,13 +227,18 @@ func (s *Sidecar) resetPeerStreamState() {
 	}
 }
 
-func (s *Sidecar) computeTrackDelay(kind string, ts uint32, now time.Time) time.Duration {
+type queuedRTP struct {
+	pkt    *rtp.Packet
+	rxTime time.Time
+}
+
+func (s *Sidecar) computeTrackDelay(kind string, ts uint32, rxTime time.Time, now time.Time) time.Duration {
 	s.timingMu.Lock()
 	defer s.timingMu.Unlock()
 
 	if !s.streamBaseSet {
 		s.streamBaseSet = true
-		s.streamBaseWall = now
+		s.streamBaseWall = rxTime
 	}
 
 	var current *TrackTiming
@@ -269,9 +266,11 @@ func (s *Sidecar) computeTrackDelay(kind string, ts uint32, now time.Time) time.
 	mediaElapsed := rtpElapsed(ts, current.baseRTP, clockRate)
 	expectedWall := s.streamBaseWall.Add(mediaElapsed)
 
-	observedLatency := now.Sub(expectedWall)
+	observedLatency := rxTime.Sub(expectedWall)
 	if observedLatency < 0 {
 		observedLatency = 0
+	} else if observedLatency > 300*time.Millisecond {
+		observedLatency = 300 * time.Millisecond
 	}
 
 	current.latency = smoothDuration(current.latency, observedLatency)
@@ -289,6 +288,9 @@ func (s *Sidecar) computeTrackDelay(kind string, ts uint32, now time.Time) time.
 	delay := targetWall.Sub(now)
 	if delay < 0 {
 		return 0
+	}
+	if delay > 100*time.Millisecond {
+		return 100 * time.Millisecond
 	}
 
 	return delay
@@ -334,6 +336,7 @@ type Peer struct {
 	closeOnce  sync.Once
 	videoSend  chan *rtp.Packet
 	audioSend  chan *rtp.Packet
+	pendingICE []webrtc.ICECandidateInit
 	droppedVid uint64
 	droppedAud uint64
 }
@@ -458,8 +461,8 @@ type Sidecar struct {
 	audioPktCount  uint64 // atomic
 	audioOctetCount uint64 // atomic
 	
-	videoQueue chan *rtp.Packet
-	audioQueue chan *rtp.Packet
+	videoQueue chan queuedRTP
+	audioQueue chan queuedRTP
 
 	// Stream pacing / A/V alignment state
 	timingMu       sync.Mutex
@@ -496,8 +499,8 @@ func NewSidecar() *Sidecar {
 		paceBurst:    paceBurst,
 		paceStep:     time.Duration(paceStepMs) * time.Millisecond,
 		maxFramePace: time.Duration(maxPaceMs) * time.Millisecond,
-		videoQueue:   make(chan *rtp.Packet, envIntOrDefault("VIDEO_QUEUE_SIZE", 1024)),
-		audioQueue:   make(chan *rtp.Packet, envIntOrDefault("AUDIO_QUEUE_SIZE", 2048)),
+		videoQueue:   make(chan queuedRTP, envIntOrDefault("VIDEO_QUEUE_SIZE", 1024)),
+		audioQueue:   make(chan queuedRTP, envIntOrDefault("AUDIO_QUEUE_SIZE", 2048)),
 	}
 }
 
@@ -547,6 +550,7 @@ func (s *Sidecar) readVideoRTP() {
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
 			continue
 		}
+		rxTime := time.Now()
 
 		// Track RTP stats used by optional debug / legacy reporting paths
 		atomic.StoreUint64(&s.lastVideoRTPTs, uint64(pkt.Timestamp))
@@ -564,7 +568,7 @@ func (s *Sidecar) readVideoRTP() {
 		}
 
 		select {
-		case s.videoQueue <- cloned:
+		case s.videoQueue <- queuedRTP{pkt: cloned, rxTime: rxTime}:
 		default:
 			if count%120 == 0 {
 				log.Printf("[VIDEO] queue full, dropping packet ts=%d", cloned.Timestamp)
@@ -590,6 +594,7 @@ func (s *Sidecar) readAudioRTP() {
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
 			continue
 		}
+		rxTime := time.Now()
 
 		// Track latest timestamp for RTCP Sender Reports
 		atomic.StoreUint64(&s.lastAudioRTPTs, uint64(pkt.Timestamp))
@@ -607,7 +612,7 @@ func (s *Sidecar) readAudioRTP() {
 		}
 
 		select {
-		case s.audioQueue <- cloned:
+		case s.audioQueue <- queuedRTP{pkt: cloned, rxTime: rxTime}:
 		default:
 			if count%200 == 0 {
 				log.Printf("[AUDIO] queue full, dropping packet ts=%d", cloned.Timestamp)
@@ -622,10 +627,11 @@ func (s *Sidecar) processVideoRTP() {
 	var frameStart time.Time
 	burstCount := 0
 
-	for pkt := range s.videoQueue {
+	for item := range s.videoQueue {
+		pkt := item.pkt
 		if !haveTS || pkt.Timestamp != lastTS {
 			now := time.Now()
-			extraDelay := s.computeTrackDelay("video", pkt.Timestamp, now)
+			extraDelay := s.computeTrackDelay("video", pkt.Timestamp, item.rxTime, now)
 			if extraDelay > 0 {
 				time.Sleep(extraDelay)
 			}
@@ -634,8 +640,8 @@ func (s *Sidecar) processVideoRTP() {
 			frameStart = time.Now()
 			burstCount = 0
 		} else if burstCount > 0 && s.maxFramePace > 0 && s.paceBurst > 0 && s.paceStep > 0 && burstCount%s.paceBurst == 0 {
-			// Spread intra-frame bursts (especially keyframes) slightly without exceeding per-frame budget
-			if time.Since(frameStart) < s.maxFramePace && len(s.videoQueue) < cap(s.videoQueue)/2 {
+			// Spread intra-frame bursts (especially keyframes) slightly without building queue backlog
+			if time.Since(frameStart) < s.maxFramePace && len(s.videoQueue) < 64 {
 				time.Sleep(s.paceStep)
 			}
 		}
@@ -669,10 +675,11 @@ func (s *Sidecar) processAudioRTP() {
 	var lastTS uint32
 	haveTS := false
 
-	for pkt := range s.audioQueue {
+	for item := range s.audioQueue {
+		pkt := item.pkt
 		if !haveTS || pkt.Timestamp != lastTS {
 			now := time.Now()
-			extraDelay := s.computeTrackDelay("audio", pkt.Timestamp, now)
+			extraDelay := s.computeTrackDelay("audio", pkt.Timestamp, item.rxTime, now)
 			if extraDelay > 0 {
 				time.Sleep(extraDelay)
 			}
@@ -695,6 +702,98 @@ func (s *Sidecar) processAudioRTP() {
 		}
 		s.peersLock.RUnlock()
 	}
+}
+
+func normalizeOfferSDP(raw string) string {
+	raw = strings.ReplaceAll(raw, "\r\n", "\n")
+	rawLines := strings.Split(raw, "\n")
+
+	var sessionLines []string
+	var mediaSections [][]string
+	var currentMedia []string
+	inMedia := false
+	sessionFingerprint := ""
+
+	for _, line := range rawLines {
+		line = strings.TrimRight(line, " \t")
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "m=") {
+			if inMedia {
+				mediaSections = append(mediaSections, currentMedia)
+			}
+			inMedia = true
+			currentMedia = []string{line}
+			continue
+		}
+		if !inMedia {
+			if strings.HasPrefix(line, "o=") && strings.HasSuffix(line, " IN IP4 0.0.0.0") {
+				line = strings.TrimSuffix(line, " IN IP4 0.0.0.0") + " IN IP4 127.0.0.1"
+			} else if line == "a=msid-semantic:WMS*" || line == "a=msid-semantic:WMS" {
+				line = "a=msid-semantic: WMS ts6-stream"
+			} else if strings.HasPrefix(line, "a=fingerprint:") {
+				sessionFingerprint = line
+				continue
+			}
+			sessionLines = append(sessionLines, line)
+		} else {
+			currentMedia = append(currentMedia, line)
+		}
+	}
+	if inMedia {
+		mediaSections = append(mediaSections, currentMedia)
+	}
+
+	out := make([]string, 0, len(rawLines)+6)
+	out = append(out, sessionLines...)
+
+	for _, sec := range mediaSections {
+		hasRTCP := false
+		hasIceOptions := false
+		hasFingerprint := false
+		for _, l := range sec {
+			if strings.HasPrefix(l, "a=rtcp:") {
+				hasRTCP = true
+			} else if strings.HasPrefix(l, "a=ice-options:") {
+				hasIceOptions = true
+			} else if strings.HasPrefix(l, "a=fingerprint:") {
+				hasFingerprint = true
+			}
+		}
+
+		for _, l := range sec {
+			if strings.HasPrefix(l, "a=ssrc:") &&
+				(strings.Contains(l, " mslabel:") || strings.Contains(l, " label:")) {
+				continue
+			}
+			if strings.HasPrefix(l, "a=candidate:") {
+				fields := strings.Fields(l)
+				if len(fields) >= 2 && fields[1] == "2" {
+					continue
+				}
+			}
+
+			out = append(out, l)
+
+			if strings.HasPrefix(l, "c=IN ") && !hasRTCP {
+				out = append(out, "a=rtcp:9 IN IP4 0.0.0.0")
+				hasRTCP = true
+			}
+			if strings.HasPrefix(l, "a=ice-pwd:") {
+				if !hasIceOptions {
+					out = append(out, "a=ice-options:trickle")
+					hasIceOptions = true
+				}
+				if !hasFingerprint && sessionFingerprint != "" {
+					out = append(out, sessionFingerprint)
+					hasFingerprint = true
+				}
+			}
+		}
+	}
+
+	return strings.Join(out, "\r\n") + "\r\n"
 }
 
 func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
@@ -727,6 +826,7 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 	s.peersLock.Unlock()
 
 	log.Printf("[API] Creating NEW peer: %s", id)
+	startTime := time.Now()
 
 	defer func() {
 		s.peersLock.Lock()
@@ -750,9 +850,10 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 	}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeOpus,
-			ClockRate: 48000,
-			Channels:  2,
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1;sprop-stereo=1",
 		},
 		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
@@ -788,7 +889,8 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 	)
 
 	cfg := webrtc.Configuration{
-		ICEServers: getIceServers(),
+		ICEServers:    getIceServers(),
+		RTCPMuxPolicy: webrtc.RTCPMuxPolicyRequire,
 	}
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("ICE_TRANSPORT_POLICY")), "relay") {
 		cfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
@@ -817,11 +919,15 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 		return "", err
 	}
 
-	if _, err = pc.AddTrack(videoTrack); err != nil {
+	if _, err = pc.AddTransceiverFromTrack(videoTrack, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	}); err != nil {
 		pc.Close()
 		return "", err
 	}
-	if _, err = pc.AddTrack(audioTrack); err != nil {
+	if _, err = pc.AddTransceiverFromTrack(audioTrack, webrtc.RTPTransceiverInit{
+		Direction: webrtc.RTPTransceiverDirectionSendonly,
+	}); err != nil {
 		pc.Close()
 		return "", err
 	}
@@ -876,7 +982,18 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 	}
 
 	gatherComplete := webrtc.GatheringCompletePromise(pc)
-	<-gatherComplete
+	gatherTimeout := time.Duration(envIntOrDefault("ICE_GATHER_TIMEOUT_MS", 2500)) * time.Millisecond
+	select {
+	case <-gatherComplete:
+	case <-time.After(gatherTimeout):
+		log.Printf("[Peer %s] ICE gathering timed out after %v, proceeding with gathered candidates", id, gatherTimeout)
+	}
+
+	ld := pc.LocalDescription()
+	if ld == nil {
+		_ = pc.Close()
+		return "", fmt.Errorf("missing local description after ICE gathering")
+	}
 
 	go peer.runVideoSender()
 	go peer.runAudioSender()
@@ -888,7 +1005,8 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 	s.peers[id] = peer
 	s.peersLock.Unlock()
 
-	sdp = pc.LocalDescription().SDP
+	sdp = normalizeOfferSDP(ld.SDP)
+	log.Printf("[Peer %s] Offer ready in %dms (%d bytes)", id, time.Since(startTime).Milliseconds(), len(sdp))
 	return sdp, nil
 }
 
@@ -993,25 +1111,42 @@ func (s *Sidecar) SetAnswer(id, sdp string) error {
 	}
 
 	peer.mu.Lock()
-	defer peer.mu.Unlock()
 
 	if peer.PC.RemoteDescription() != nil {
 		if peer.PC.RemoteDescription().Type == webrtc.SDPTypeAnswer &&
 			peer.PC.SignalingState() == webrtc.SignalingStateStable {
-			debugf("[API] Ignoring duplicate answer for peer: %s", id)
+			peer.mu.Unlock()
+			log.Printf("[API] Ignoring duplicate answer for peer: %s", id)
 			return nil
 		}
 	}
 
 	if peer.PC.SignalingState() != webrtc.SignalingStateHaveLocalOffer {
-		debugf("[API] Ignoring answer in signaling state %s for peer: %s", peer.PC.SignalingState(), id)
+		state := peer.PC.SignalingState()
+		peer.mu.Unlock()
+		log.Printf("[API] Ignoring answer in signaling state %s for peer: %s", state, id)
 		return nil
 	}
 
-	return peer.PC.SetRemoteDescription(webrtc.SessionDescription{
+	if err := peer.PC.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
 		SDP:  sdp,
-	})
+	}); err != nil {
+		peer.mu.Unlock()
+		return err
+	}
+
+	queued := peer.pendingICE
+	peer.pendingICE = nil
+	peer.mu.Unlock()
+
+	for _, cand := range queued {
+		if err := peer.PC.AddICECandidate(cand); err != nil {
+			log.Printf("[API] Flushed ICE error (peer=%s): %v", id, err)
+		}
+	}
+
+	return nil
 }
 
 func (s *Sidecar) AddICECandidate(id string, candidate string, sdpMid string, sdpMLineIndex uint16) error {
@@ -1022,11 +1157,21 @@ func (s *Sidecar) AddICECandidate(id string, candidate string, sdpMid string, sd
 		return fmt.Errorf("peer %s not found", id)
 	}
 
-	return peer.PC.AddICECandidate(webrtc.ICECandidateInit{
+	init := webrtc.ICECandidateInit{
 		Candidate:     candidate,
 		SDPMid:        &sdpMid,
 		SDPMLineIndex: &sdpMLineIndex,
-	})
+	}
+
+	peer.mu.Lock()
+	if peer.PC.RemoteDescription() == nil {
+		peer.pendingICE = append(peer.pendingICE, init)
+		peer.mu.Unlock()
+		return nil
+	}
+	peer.mu.Unlock()
+
+	return peer.PC.AddICECandidate(init)
 }
 
 func (s *Sidecar) ClosePeer(id string) {
@@ -1087,9 +1232,9 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	if vBufsize == "" {
 		vBufsize = vBitrate
 	}
-	gop := envIntOrDefault("VIDEO_GOP", fps*2)
+	gop := envIntOrDefault("VIDEO_GOP", fps)
 	if gop < 1 {
-		gop = fps * 2
+		gop = fps
 	}
 	gopStr := strconv.Itoa(gop)
 	cpuUsed := envOrDefault("VIDEO_CPU_USED", "6")
@@ -1261,7 +1406,7 @@ func main() {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		debugf("[API] Setting answer for peer: %s (%d bytes)", req.ID, len(req.SDP))
+		log.Printf("[API] Setting answer for peer: %s (%d bytes)", req.ID, len(req.SDP))
 
 		if err := sidecar.SetAnswer(req.ID, req.SDP); err != nil {
 			log.Printf("[API] SetAnswer error: %v", err)

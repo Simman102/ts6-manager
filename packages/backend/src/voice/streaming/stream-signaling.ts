@@ -40,11 +40,18 @@ export interface SignalingMessage {
 export class StreamSignaling extends EventEmitter {
   private client: Ts3Client;
   private activeStreams: Map<string, ActiveStream> = new Map();
+  private commandListener: (parsed: any) => void;
 
   constructor(client: Ts3Client) {
     super();
     this.client = client;
-    this.client.on('command', (parsed: any) => this.handleCommand(parsed));
+    this.commandListener = (parsed: any) => this.handleCommand(parsed);
+    this.client.on('command', this.commandListener);
+  }
+
+  destroy(): void {
+    this.client.removeListener('command', this.commandListener);
+    this.removeAllListeners();
   }
 
   getActiveStreams(): Map<string, ActiveStream> {
@@ -66,16 +73,24 @@ export class StreamSignaling extends EventEmitter {
         this.emit('joinStreamRequest', parsed.params);
         break;
       case 'notifyrespondjoinstreamrequest':
+        console.log(`[StreamSignaling] Join stream response: clid=${parsed.params?.clid}, decision=${parsed.params?.decision}`);
         this.handleJoinStreamResponse(parsed);
         break;
       case 'notifystreamclientjoined':
+        console.log(`[StreamSignaling] Client joined stream: clid=${parsed.params?.clid}, stream=${parsed.params?.id || parsed.params?.stream_id || ''}`);
         this.emit('streamClientJoined', parsed.params);
         break;
       case 'notifystreamclientleft':
+        console.log(`[StreamSignaling] Client left stream: clid=${parsed.params?.clid}, reason=${parsed.params?.reasonid || parsed.params?.reason || ''}`);
         this.emit('streamClientLeft', parsed.params);
         break;
       case 'notifystreaminfo':
         this.handleStreamInfo(parsed);
+        break;
+      default:
+        if (typeof parsed.name === 'string' && parsed.name.toLowerCase().includes('stream')) {
+          console.log(`[StreamSignaling] Unhandled stream command: ${parsed.name} params=${JSON.stringify(parsed.params).slice(0, 200)}`);
+        }
         break;
     }
   }
@@ -107,6 +122,7 @@ export class StreamSignaling extends EventEmitter {
 
   private handleStreamStopped(parsed: any): void {
     const streamId = parsed.params.id || parsed.params.stream_id || '';
+    console.log(`[StreamSignaling] Stream stopped: id=${streamId}, clid=${parsed.params.clid || ''}, reason=${parsed.params.reasonid || parsed.params.reason || ''}`);
     const stream = this.activeStreams.get(streamId);
     this.activeStreams.delete(streamId);
     this.emit('streamStopped', { streamId, stream });
@@ -122,12 +138,16 @@ export class StreamSignaling extends EventEmitter {
   private handleStreamSignaling(parsed: any): void {
     const p = parsed.params;
     const dataStr = p.json || p.data || '';
-    if (!dataStr) return;
+    if (!dataStr) {
+      console.warn(`[StreamSignaling] notifystreamsignaling missing json/data: ${JSON.stringify(p)}`);
+      return;
+    }
 
     try {
       const payload = JSON.parse(dataStr);
       const cmd = payload.cmd;
       const args = payload.args || {};
+      console.log(`[StreamSignaling] Incoming signaling: cmd=${cmd}, clid=${p.clid || ''}, stream=${p.id || p.stream_id || ''}`);
 
       switch (cmd) {
         case 'offer':
@@ -169,6 +189,9 @@ export class StreamSignaling extends EventEmitter {
             streamId: p.id || p.stream_id,
             raw: dataStr,
           } as SignalingMessage);
+          break;
+        default:
+          console.warn(`[StreamSignaling] Unrecognized signaling cmd=${cmd}: ${dataStr.substring(0, 200)}`);
           break;
       }
     } catch {

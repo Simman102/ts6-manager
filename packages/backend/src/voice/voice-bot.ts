@@ -8,24 +8,18 @@ import { SidecarClient } from './streaming/sidecar-client.js';
 import { SidecarProcess, type SidecarConfig } from './streaming/sidecar-process.js';
 import { STREAM_PRESETS, DEFAULT_PRESET, type VideoViewerInfo, type VideoStreamStatus } from './streaming/types.js';
 import { getCookieArgs } from './audio/youtube.js';
+import { unwrapBbCodeUrls } from '../utils/bbcode.js';
 import { spawn } from 'child_process';
 
-/** Resolve a YouTube/yt-dlp-compatible URL to a direct stream URL */
-function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<string> {
-  // Only resolve YouTube and other yt-dlp-supported sites
-  if (!url.includes('youtube.com/') && !url.includes('youtu.be/') && !url.includes('twitch.tv/')) {
-    return Promise.resolve(url);
-  }
-
+function runYtDlpResolve(cleanUrl: string, formatFilter: string, extraArgs: string[]): Promise<string> {
   return new Promise((resolve, reject) => {
-    // Request best combined format (video+audio) up to the target height
-    const formatFilter = `best[height<=${maxHeight}][ext=mp4]/best[height<=${maxHeight}]/best[ext=mp4]/best`;
     const proc = spawn('yt-dlp', [
       ...getCookieArgs(),
+      ...extraArgs,
       '-f', formatFilter,
       '--no-playlist',
       '-g',  // print direct URL only
-      url,
+      cleanUrl,
     ], { shell: false });
 
     let stdout = '';
@@ -35,14 +29,19 @@ function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<string> 
 
     proc.on('close', (code) => {
       if (code !== 0) {
-        return reject(new Error(`yt-dlp failed (code ${code}): ${stderr.slice(0, 200)}`));
+        const errorLines = stderr
+          .split(/\r?\n/)
+          .filter((line) => line.includes('ERROR:'))
+          .join(' ')
+          .trim();
+        const detail = errorLines || stderr.trim().slice(-250);
+        return reject(new Error(`yt-dlp failed (code ${code}): ${detail.slice(0, 250)}`));
       }
       // yt-dlp -g returns the direct URL(s), take the first one
-      const directUrl = stdout.trim().split('\n')[0];
+      const directUrl = stdout.trim().split(/\r?\n/)[0];
       if (!directUrl) {
         return reject(new Error('yt-dlp returned no URL'));
       }
-      console.log(`[VideoResolve] Resolved: ${url.substring(0, 60)}... → direct URL`);
       resolve(directUrl);
     });
 
@@ -50,6 +49,42 @@ function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<string> 
       reject(new Error(`yt-dlp not found: ${err.message}`));
     });
   });
+}
+
+/** Resolve a YouTube/yt-dlp-compatible URL to a direct stream URL */
+async function resolveVideoUrl(url: string, maxHeight: number = 720): Promise<string> {
+  const cleanUrl = unwrapBbCodeUrls(url);
+
+  // Only resolve YouTube and other yt-dlp-supported sites
+  const isYouTube = cleanUrl.includes('youtube.com/') || cleanUrl.includes('youtu.be/');
+  if (!isYouTube && !cleanUrl.includes('twitch.tv/')) {
+    return cleanUrl;
+  }
+
+  // Request best combined format (video+audio) up to the target height
+  const formatFilter = `best[height<=${maxHeight}][ext=mp4]/best[height<=${maxHeight}]/best[ext=mp4]/best`;
+
+  if (isYouTube) {
+    // Prefer android client first (retry once against intermittent SABR format glitches)
+    // so FFmpeg does not receive TVHTML5 URLs that return 403 Forbidden.
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const directUrl = await runYtDlpResolve(cleanUrl, formatFilter, [
+          '--extractor-args',
+          'youtube:player_client=android',
+        ]);
+        console.log(`[VideoResolve] Resolved (android): ${cleanUrl.substring(0, 60)}... → direct URL`);
+        return directUrl;
+      } catch (err: any) {
+        console.warn(`[VideoResolve] android client attempt ${attempt}/2 failed: ${err?.message || err}`);
+      }
+    }
+    console.warn(`[VideoResolve] Falling back to default yt-dlp client for ${cleanUrl.substring(0, 60)}...`);
+  }
+
+  const directUrl = await runYtDlpResolve(cleanUrl, formatFilter, []);
+  console.log(`[VideoResolve] Resolved: ${cleanUrl.substring(0, 60)}... → direct URL`);
+  return directUrl;
 }
 
 export type VoiceBotStatus = 'stopped' | 'starting' | 'connected' | 'playing' | 'paused' | 'error';
@@ -158,7 +193,12 @@ export class VoiceBot extends EventEmitter {
     this.client.on('ts3error', (params: Record<string, string>) => {
       const id = parseInt(params.id || '0');
       const msg = params.msg || 'unknown error';
-      this._lastError = `TS3 error ${id}: ${msg}`;
+      const extra = params.extra_msg ? ` (${params.extra_msg})` : '';
+      const permid = params.failed_permid ? ` [permid=${params.failed_permid}]` : '';
+      this._lastError = `TS3 error ${id}: ${msg}${extra}${permid}`;
+      if (id !== 0) {
+        console.warn(`[VoiceBot ${this.config.id}] ${this._lastError}`);
+      }
       // Fatal errors that should not trigger reconnect
       // 2568 = invalid password, 3329 = banned, 1796 = max clients reached
       if (id === 2568 || id === 3329 || id === 1796) {
@@ -773,6 +813,7 @@ export class VoiceBot extends EventEmitter {
       throw new Error('Video stream already active');
     }
 
+    const cleanSource = unwrapBbCodeUrls(source);
     const sidecarBinary = this.config.sidecarBinaryPath || process.env.SIDECAR_BINARY_PATH || 'sidecar';
     const sidecarPort = this.config.sidecarPort || 9800;
     this._videoPreset = preset ?? this.config.streamPreset ?? DEFAULT_PRESET;
@@ -786,6 +827,10 @@ export class VoiceBot extends EventEmitter {
 
     this._videoFramerate = effectiveFramerate;
     this._videoBitrate = effectiveBitrate;
+
+    // Resolve YouTube/streaming URLs via yt-dlp BEFORE starting sidecar or TS6 stream
+    // so resolution errors don't leave a zombie TS6 stream with no video.
+    const resolvedSource = await resolveVideoUrl(cleanSource, presetConfig.height);
 
     // Check if sidecar URL is set (Docker mode — sidecar runs as separate container)
     const sidecarUrl = process.env.SIDECAR_URL;
@@ -828,6 +873,7 @@ export class VoiceBot extends EventEmitter {
     console.log(`[VoiceBot ${this.config.id}] Sidecar ready`);
 
     // Setup stream signaling on the TS3 client
+    this.signaling?.destroy();
     this.signaling = new StreamSignaling(this.client);
     this.setupSignalingListeners();
     this.signaling.registerStreamNotifications();
@@ -859,21 +905,24 @@ export class VoiceBot extends EventEmitter {
     const stream = await streamPromise;
     this._activeStreamId = stream.id;
     this._videoStreaming = true;
-    this._videoSource = source;
+    this._videoSource = cleanSource;
     this._videoStartedAt = Date.now();
 
-    // Resolve YouTube/streaming URLs via yt-dlp, then start ffmpeg
-    const resolvedSource = await resolveVideoUrl(source, presetConfig.height);
-    await this.sidecarHttp.setSource(
-      resolvedSource,
-      presetConfig.width,
-      presetConfig.height,
-      effectiveFramerate,
-      effectiveBitrate,
-    );
+    try {
+      await this.sidecarHttp.setSource(
+        resolvedSource,
+        presetConfig.width,
+        presetConfig.height,
+        effectiveFramerate,
+        effectiveBitrate,
+      );
+    } catch (err) {
+      await this.stopVideoStream().catch(() => {});
+      throw err;
+    }
 
-    console.log(`[VoiceBot ${this.config.id}] Video stream started: ${stream.id}, source: ${source}`);
-    this.emit('videoStreamStarted', { streamId: stream.id, source, preset: this._videoPreset });
+    console.log(`[VoiceBot ${this.config.id}] Video stream started: ${stream.id}, source: ${cleanSource}`);
+    this.emit('videoStreamStarted', { streamId: stream.id, source: cleanSource, preset: this._videoPreset });
     this.emit('statusChange', this._status);
   }
 
@@ -893,6 +942,7 @@ export class VoiceBot extends EventEmitter {
     for (const [clid] of this._viewers) {
       try { await this.sidecarHttp?.closePeer(String(clid)); } catch { /* ignore */ }
     }
+    try { await this.sidecarHttp?.closePeer('webui-preview'); } catch { /* ignore */ }
     this._viewers.clear();
 
     // Stop TS6 stream
@@ -914,6 +964,7 @@ export class VoiceBot extends EventEmitter {
     this._videoSource = null;
     this._videoStreaming = false;
     this._videoStartedAt = null;
+    this.signaling?.destroy();
     this.signaling = null;
 
     console.log(`[VoiceBot ${this.config.id}] Video stream stopped`);
@@ -926,9 +977,9 @@ export class VoiceBot extends EventEmitter {
     if (!this._videoStreaming || !this.sidecarHttp) {
       throw new Error('No active video stream');
     }
-    this._videoSource = source;
+    const cleanSource = unwrapBbCodeUrls(source);
     const currentPreset = STREAM_PRESETS[this._videoPreset] || STREAM_PRESETS[DEFAULT_PRESET];
-    const resolvedSource = await resolveVideoUrl(source, currentPreset.height);
+    const resolvedSource = await resolveVideoUrl(cleanSource, currentPreset.height);
 
     await this.sidecarHttp.setSource(
       resolvedSource,
@@ -937,8 +988,9 @@ export class VoiceBot extends EventEmitter {
       this._videoFramerate,
       this._videoBitrate,
     );
-    console.log(`[VoiceBot ${this.config.id}] Video source changed: ${source}`);
-    this.emit('videoSourceChanged', source);
+    this._videoSource = cleanSource;
+    console.log(`[VoiceBot ${this.config.id}] Video source changed: ${cleanSource}`);
+    this.emit('videoSourceChanged', cleanSource);
   }
 
   /** Kick a viewer from the video stream */
@@ -1002,6 +1054,7 @@ export class VoiceBot extends EventEmitter {
     switch (msg.type) {
       case 'answer':
         if (msg.sdp && msg.clid) {
+          console.log(`[VoiceBot ${this.config.id}] WebRTC answer received from clid=${msg.clid}`);
           try {
             await this.sidecarHttp.setAnswer(String(msg.clid), msg.sdp);
           } catch (err: any) {
@@ -1026,9 +1079,24 @@ export class VoiceBot extends EventEmitter {
       case 'reconnect':
         if (msg.clid && this._activeStreamId) {
           console.log(`[VoiceBot ${this.config.id}] Reconnect from clid=${msg.clid}`);
-          try { await this.sidecarHttp.closePeer(String(msg.clid)); } catch { /* ignore */ }
-          this._viewers.delete(msg.clid);
-          await this.handleViewerJoin(msg.clid, this._activeStreamId);
+          try {
+            try { await this.sidecarHttp.closePeer(String(msg.clid)); } catch { /* ignore */ }
+            const result = await this.sidecarHttp.createPeer(String(msg.clid));
+            const viewer: VideoViewerInfo = {
+              clid: msg.clid,
+              joinedAt: this._viewers.get(msg.clid)?.joinedAt ?? Date.now(),
+              iceState: 'new',
+            };
+            this._viewers.set(msg.clid, viewer);
+            this.signaling?.sendSignaling(
+              msg.clid,
+              { cmd: 'reconnectOffer', args: { offer: result.sdp } },
+              this._activeStreamId,
+            );
+            console.log(`[VoiceBot ${this.config.id}] Sent reconnectOffer to clid=${msg.clid}`);
+          } catch (err: any) {
+            console.error(`[VoiceBot ${this.config.id}] reconnect error (clid=${msg.clid}): ${err.message}`);
+          }
         }
         break;
     }
@@ -1038,9 +1106,8 @@ export class VoiceBot extends EventEmitter {
     if (!this.sidecarHttp || !this.signaling) return;
 
     try {
-      if (this._viewers.has(viewerClid)) {
-        try { await this.sidecarHttp.closePeer(String(viewerClid)); } catch { /* ignore */ }
-      }
+      // Always close any stale peer on the sidecar (e.g. after a backend restart or silent drop)
+      try { await this.sidecarHttp.closePeer(String(viewerClid)); } catch { /* ignore */ }
 
       const result = await this.sidecarHttp.createPeer(String(viewerClid));
 

@@ -69,6 +69,26 @@ interface ResendPacket {
   lastSend: number;
 }
 
+interface InCommandState {
+  initialized: boolean;
+  nextId: number;
+  reorderBuf: Map<number, { data: Buffer; flags: number }>;
+  fragmentBuffer: Buffer[];
+  fragmenting: boolean;
+  fragmentFlags: number;
+}
+
+function createInCommandState(): InCommandState {
+  return {
+    initialized: false,
+    nextId: 0,
+    reorderBuf: new Map(),
+    fragmentBuffer: [],
+    fragmenting: false,
+    fragmentFlags: 0,
+  };
+}
+
 export interface Ts3ClientOptions {
   host: string;
   port: number;
@@ -114,10 +134,11 @@ export class Ts3Client extends EventEmitter {
   // Client ID assigned by server
   private clientId = 0;
 
-  // Fragment reassembly
-  private fragmentBuffer: Buffer[] = [];
-  private fragmenting = false;
-  private fragmentFlags = 0;
+  // Incoming command ordering & per-type fragment reassembly
+  private inCommandState: Record<number, InCommandState> = {
+    [PacketType.Command]: createInCommandState(),
+    [PacketType.CommandLow]: createInCommandState(),
+  };
 
   // Channel map (populated during init sequence for auto-move)
   private channelMap = new Map<string, number>(); // channel_name → cid
@@ -146,9 +167,10 @@ export class Ts3Client extends EventEmitter {
     this.packetCounter.fill(0);
     this.generationCounter.fill(0);
     this.inGenerationCounter.fill(0);
-    this.fragmentBuffer = [];
-    this.fragmenting = false;
-    this.fragmentFlags = 0;
+    this.inCommandState = {
+      [PacketType.Command]: createInCommandState(),
+      [PacketType.CommandLow]: createInCommandState(),
+    };
     this.clientId = 0;
     this.channelMap.clear();
 
@@ -534,11 +556,29 @@ export class Ts3Client extends EventEmitter {
 
     this.lastMessageTime = Date.now();
 
-    // Decrypt
-    const gen = this.inGenerationCounter[packetType] || 0;
+    // Decrypt (compute generation accounting for 16-bit wraparound on ordered command channels)
+    const isCommandType =
+      packetType === PacketType.Command || packetType === PacketType.CommandLow;
+    let gen = this.inGenerationCounter[packetType] || 0;
+    if (isCommandType) {
+      const cmdState = this.inCommandState[packetType];
+      if (cmdState?.initialized) {
+        if (packetId < cmdState.nextId && cmdState.nextId - packetId > 32768) {
+          gen = gen + 1;
+        } else if (
+          packetId > cmdState.nextId &&
+          packetId - cmdState.nextId > 32768 &&
+          gen > 0
+        ) {
+          gen = gen - 1;
+        }
+      }
+    }
     const data = this.decryptPacket(raw, packetType, packetId, gen, flags);
     if (!data) {
-      this.emit("debug", `Failed to decrypt packet type=${packetType} id=${packetId}`);
+      const msg = `Failed to decrypt packet type=${packetType} id=${packetId} gen=${gen} flags=0x${flags.toString(16)}`;
+      this.emit("debug", msg);
+      console.warn(`[TS3Client] ${msg}`);
       return;
     }
 
@@ -549,7 +589,7 @@ export class Ts3Client extends EventEmitter {
       case PacketType.Command:
       case PacketType.CommandLow:
         this.sendAck(packetId, packetType === PacketType.Command ? PacketType.Ack : PacketType.AckLow);
-        this.handleCommandData(data, flags);
+        this.handleOrderedCommandPacket(packetType, packetId, data, flags);
         break;
       case PacketType.Ack:
         this.handleAck(data);
@@ -679,30 +719,115 @@ export class Ts3Client extends EventEmitter {
     }
   }
 
-  private handleCommandData(data: Buffer, flags: number): void {
+  private handleOrderedCommandPacket(
+    packetType: PacketType,
+    packetId: number,
+    data: Buffer,
+    flags: number
+  ): void {
+    const state = this.inCommandState[packetType];
+    if (!state) {
+      this.processCommand(data, flags);
+      return;
+    }
+
+    if (!state.initialized) {
+      state.initialized = true;
+      state.nextId = packetId;
+    }
+
+    const diff = (packetId - state.nextId + 65536) & 0xffff;
+    if (diff >= 32768) {
+      // Duplicate or already-processed old packet (ACK was already sent)
+      return;
+    }
+
+    if (diff > 0) {
+      if (!state.reorderBuf.has(packetId)) {
+        state.reorderBuf.set(packetId, { data: Buffer.from(data), flags });
+        if (state.reorderBuf.size === 8 || state.reorderBuf.size % 16 === 0) {
+          console.warn(
+            `[TS3Client] Buffering ${state.reorderBuf.size} out-of-order packets (type=${packetType}, expecting=${state.nextId}, got=${packetId})`
+          );
+        }
+      }
+
+      if (state.reorderBuf.size > 64) {
+        // Advance past missing gap so the channel cannot wedge indefinitely
+        let bestId = -1;
+        let bestDist = 65536;
+        for (const bufferedId of state.reorderBuf.keys()) {
+          const d = (bufferedId - state.nextId + 65536) & 0xffff;
+          if (d > 0 && d < bestDist) {
+            bestDist = d;
+            bestId = bufferedId;
+          }
+        }
+        if (bestId >= 0) {
+          console.warn(
+            `[TS3Client] Out-of-order buffer overflow (type=${packetType}), advancing nextId ${state.nextId} → ${bestId}`
+          );
+          if (bestId < state.nextId) {
+            this.inGenerationCounter[packetType]++;
+          }
+          state.nextId = bestId;
+          this.drainOrderedPackets(packetType, state);
+        }
+      }
+      return;
+    }
+
+    // diff === 0: in-order packet
+    this.handleCommandDataForState(state, data, flags);
+    const next = (state.nextId + 1) & 0xffff;
+    if (next === 0) {
+      this.inGenerationCounter[packetType]++;
+    }
+    state.nextId = next;
+    this.drainOrderedPackets(packetType, state);
+  }
+
+  private drainOrderedPackets(packetType: PacketType, state: InCommandState): void {
+    while (state.reorderBuf.has(state.nextId)) {
+      const entry = state.reorderBuf.get(state.nextId)!;
+      state.reorderBuf.delete(state.nextId);
+      this.handleCommandDataForState(state, entry.data, entry.flags);
+      const next = (state.nextId + 1) & 0xffff;
+      if (next === 0) {
+        this.inGenerationCounter[packetType]++;
+      }
+      state.nextId = next;
+    }
+  }
+
+  private handleCommandDataForState(state: InCommandState, data: Buffer, flags: number): void {
     // Handle fragmented packets
     if (flags & FLAG_FRAGMENTED) {
-      if (!this.fragmenting) {
+      if (!state.fragmenting) {
         // Start of fragment
-        this.fragmenting = true;
-        this.fragmentFlags = flags;
-        this.fragmentBuffer = [Buffer.from(data)];
+        state.fragmenting = true;
+        state.fragmentFlags = flags;
+        state.fragmentBuffer = [Buffer.from(data)];
       } else {
         // End of fragment
-        this.fragmentBuffer.push(Buffer.from(data));
-        const merged = Buffer.concat(this.fragmentBuffer);
-        const savedFlags = this.fragmentFlags;
-        this.fragmenting = false;
-        this.fragmentFlags = 0;
-        this.fragmentBuffer = [];
+        state.fragmentBuffer.push(Buffer.from(data));
+        const fragmentCount = state.fragmentBuffer.length;
+        const merged = Buffer.concat(state.fragmentBuffer);
+        const savedFlags = state.fragmentFlags;
+        state.fragmenting = false;
+        state.fragmentFlags = 0;
+        state.fragmentBuffer = [];
+        console.log(
+          `[TS3Client] Reassembled incoming command: ${fragmentCount} fragments, ${merged.length} bytes, compressed=${Boolean(savedFlags & FLAG_COMPRESSED)}`
+        );
         this.processCommand(merged, savedFlags);
       }
       return;
     }
 
-    if (this.fragmenting) {
+    if (state.fragmenting) {
       // Middle fragment
-      this.fragmentBuffer.push(Buffer.from(data));
+      state.fragmentBuffer.push(Buffer.from(data));
       return;
     }
 
@@ -716,6 +841,9 @@ export class Ts3Client extends EventEmitter {
         data = qlzDecompress(data);
       } catch (e: any) {
         this.emit("debug", `Decompression failed: ${e.message}`);
+        console.warn(
+          `[TS3Client] QuickLZ decompression failed (len=${data.length}, flags=0x${flags.toString(16)}): ${e.message}`
+        );
         return;
       }
     }
