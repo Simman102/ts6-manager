@@ -253,7 +253,20 @@ The Docker images handle migrations automatically on startup.
 | `SIDECAR_DEBUG_LOGS` | `1` | Enables verbose debug logging for high-frequency runtime details |
 | `VIDEO_READ_RTP_BUFFER` | `4194304` | UDP OS-socketbuffer for video port |
 | `AUDIO_READ_RTP_BUFFER` | `1048576` | UDP OS-socketbuffer for audio port |
-| `VIDEO_BUFSIZE` | `1M` | FFmpeg Video Buffer |
+| `VIDEO_BUFSIZE` | matches bitrate | FFmpeg Video Buffer (defaults to target bitrate, e.g. `2500k`) |
+| `VIDEO_GOP` | `2 * fps` | Keyframe interval in frames (`-g` / `-keyint_min`) |
+| `VIDEO_CPU_USED` | `6` | libvpx `-cpu-used` speed/quality trade-off |
+| `VIDEO_PACE_BURST` | `4` | Packets per mini-burst before pacing sleep (`0` disables intra-frame pacing) |
+| `VIDEO_PACE_STEP_MS` | `2` | Sleep duration (ms) between intra-frame bursts |
+| `VIDEO_MAX_PACE_MS` | `12` | Max pacing budget (ms) per video frame (`0` disables) |
+| `PEER_VIDEO_QUEUE_SIZE` | `256` | Per-viewer buffered video RTP queue size |
+| `PEER_AUDIO_QUEUE_SIZE` | `256` | Per-viewer buffered audio RTP queue size |
+| `STUN_SERVERS` | built-in list | Comma-separated STUN server URLs |
+| `TURN_URL` / `TURN_URLS` | — | Optional comma-separated TURN server URL(s) (e.g. `turn:host:3478`, `turns:host:443?transport=tcp`) |
+| `TURN_USER` / `TURN_PASS` | — | Credentials for the configured TURN server(s) |
+| `ICE_TRANSPORT_POLICY` | `all` | Set to `relay` to force WebRTC media through TURN |
+| `WEBRTC_UDP_MIN` / `WEBRTC_UDP_MAX` | — | Optional ephemeral UDP port range for Pion ICE |
+| `WEBRTC_PUBLIC_IP` | — | Optional comma-separated public IP(s) advertised via 1:1 NAT |
 
 ## Music Bot Text Commands
 

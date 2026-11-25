@@ -41,6 +41,47 @@ func getStunServers() []string {
 	return defaultStunServers
 }
 
+func parseCSVEnv(key string) []string {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func getIceServers() []webrtc.ICEServer {
+	iceServers := []webrtc.ICEServer{}
+	for _, stun := range getStunServers() {
+		if trimmed := strings.TrimSpace(stun); trimmed != "" {
+			iceServers = append(iceServers, webrtc.ICEServer{URLs: []string{trimmed}})
+		}
+	}
+
+	turnURLs := parseCSVEnv("TURN_URLS")
+	if len(turnURLs) == 0 {
+		turnURLs = parseCSVEnv("TURN_URL")
+	}
+	if len(turnURLs) > 0 {
+		user := envOrDefault("TURN_USER", os.Getenv("TURN_USERNAME"))
+		pass := envOrDefault("TURN_PASS", os.Getenv("TURN_CREDENTIAL"))
+		iceServers = append(iceServers, webrtc.ICEServer{
+			URLs:           turnURLs,
+			Username:       user,
+			Credential:     pass,
+			CredentialType: webrtc.ICECredentialTypePassword,
+		})
+	}
+
+	return iceServers
+}
+
 func envOrDefault(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -190,6 +231,7 @@ func (s *Sidecar) resetPeerStreamState() {
 		peer.mu.Lock()
 		peer.Started = false
 		peer.mu.Unlock()
+		peer.drainQueues()
 	}
 }
 
@@ -279,16 +321,118 @@ type createInFlight struct {
 }
 
 type Peer struct {
-	ID              string
-	PC              *webrtc.PeerConnection
-	VideoTrack      *webrtc.TrackLocalStaticRTP
-	AudioTrack      *webrtc.TrackLocalStaticRTP
-	VideoSSRC       uint32
-	AudioSSRC       uint32
-	Active          bool
-	Started         bool
-	mu              sync.Mutex
-	stopSR          chan struct{}
+	ID         string
+	PC         *webrtc.PeerConnection
+	VideoTrack *webrtc.TrackLocalStaticRTP
+	AudioTrack *webrtc.TrackLocalStaticRTP
+	VideoSSRC  uint32
+	AudioSSRC  uint32
+	Active     bool
+	Started    bool
+	mu         sync.Mutex
+	stopSR     chan struct{}
+	closeOnce  sync.Once
+	videoSend  chan *rtp.Packet
+	audioSend  chan *rtp.Packet
+	droppedVid uint64
+	droppedAud uint64
+}
+
+func (p *Peer) Close() {
+	p.mu.Lock()
+	p.Active = false
+	p.Started = false
+	p.mu.Unlock()
+
+	p.closeOnce.Do(func() {
+		close(p.stopSR)
+		if p.PC != nil {
+			_ = p.PC.Close()
+		}
+	})
+}
+
+func (p *Peer) drainQueues() {
+	for {
+		select {
+		case <-p.videoSend:
+		default:
+			goto drainAudio
+		}
+	}
+
+drainAudio:
+	for {
+		select {
+		case <-p.audioSend:
+		default:
+			return
+		}
+	}
+}
+
+func (p *Peer) enqueueVideo(pkt *rtp.Packet) {
+	if pkt == nil || p.VideoTrack == nil {
+		return
+	}
+	select {
+	case <-p.stopSR:
+		return
+	default:
+	}
+	select {
+	case p.videoSend <- pkt:
+	default:
+		n := atomic.AddUint64(&p.droppedVid, 1)
+		if n == 1 || n%120 == 0 {
+			log.Printf("[Peer %s] Video send queue full (dropped=%d)", p.ID, n)
+		}
+	}
+}
+
+func (p *Peer) enqueueAudio(pkt *rtp.Packet) {
+	if pkt == nil || p.AudioTrack == nil {
+		return
+	}
+	select {
+	case <-p.stopSR:
+		return
+	default:
+	}
+	select {
+	case p.audioSend <- pkt:
+	default:
+		n := atomic.AddUint64(&p.droppedAud, 1)
+		if n == 1 || n%200 == 0 {
+			log.Printf("[Peer %s] Audio send queue full (dropped=%d)", p.ID, n)
+		}
+	}
+}
+
+func (p *Peer) runVideoSender() {
+	for {
+		select {
+		case <-p.stopSR:
+			return
+		case pkt := <-p.videoSend:
+			if pkt != nil && p.VideoTrack != nil {
+				_ = p.VideoTrack.WriteRTP(pkt)
+			}
+		}
+	}
+}
+
+func (p *Peer) runAudioSender() {
+	for {
+		select {
+		case <-p.stopSR:
+			return
+		case pkt := <-p.audioSend:
+			if pkt != nil && p.AudioTrack != nil {
+				_ = p.AudioTrack.WriteRTP(pkt)
+			}
+		}
+	}
 }
 
 type Sidecar struct {
@@ -325,16 +469,35 @@ type Sidecar struct {
 	audioTiming    TrackTiming
 	syncBuffer     time.Duration
 	videoBias      time.Duration
+	paceBurst      int
+	paceStep       time.Duration
+	maxFramePace   time.Duration
 }
 
 func NewSidecar() *Sidecar {
+	paceBurst := envIntOrDefault("VIDEO_PACE_BURST", 4)
+	if paceBurst < 0 {
+		paceBurst = 0
+	}
+	paceStepMs := envIntOrDefault("VIDEO_PACE_STEP_MS", 2)
+	if paceStepMs < 0 {
+		paceStepMs = 0
+	}
+	maxPaceMs := envIntOrDefault("VIDEO_MAX_PACE_MS", 12)
+	if maxPaceMs < 0 {
+		maxPaceMs = 0
+	}
+
 	return &Sidecar{
-		peers:      make(map[string]*Peer),
-		creating:   make(map[string]*createInFlight),
-		syncBuffer: time.Duration(envIntOrDefault("SYNC_PLAYOUT_BUFFER_MS", 50)) * time.Millisecond,
-		videoBias:  time.Duration(envIntOrDefault("SYNC_VIDEO_BIAS_MS", 0)) * time.Millisecond,
-		videoQueue: make(chan *rtp.Packet, envIntOrDefault("VIDEO_QUEUE_SIZE", 1024)),
-		audioQueue: make(chan *rtp.Packet, envIntOrDefault("AUDIO_QUEUE_SIZE", 2048)),
+		peers:        make(map[string]*Peer),
+		creating:     make(map[string]*createInFlight),
+		syncBuffer:   time.Duration(envIntOrDefault("SYNC_PLAYOUT_BUFFER_MS", 50)) * time.Millisecond,
+		videoBias:    time.Duration(envIntOrDefault("SYNC_VIDEO_BIAS_MS", 0)) * time.Millisecond,
+		paceBurst:    paceBurst,
+		paceStep:     time.Duration(paceStepMs) * time.Millisecond,
+		maxFramePace: time.Duration(maxPaceMs) * time.Millisecond,
+		videoQueue:   make(chan *rtp.Packet, envIntOrDefault("VIDEO_QUEUE_SIZE", 1024)),
+		audioQueue:   make(chan *rtp.Packet, envIntOrDefault("AUDIO_QUEUE_SIZE", 2048)),
 	}
 }
 
@@ -456,6 +619,8 @@ func (s *Sidecar) readAudioRTP() {
 func (s *Sidecar) processVideoRTP() {
 	var lastTS uint32
 	haveTS := false
+	var frameStart time.Time
+	burstCount := 0
 
 	for pkt := range s.videoQueue {
 		if !haveTS || pkt.Timestamp != lastTS {
@@ -466,6 +631,13 @@ func (s *Sidecar) processVideoRTP() {
 			}
 			lastTS = pkt.Timestamp
 			haveTS = true
+			frameStart = time.Now()
+			burstCount = 0
+		} else if burstCount > 0 && s.maxFramePace > 0 && s.paceBurst > 0 && s.paceStep > 0 && burstCount%s.paceBurst == 0 {
+			// Spread intra-frame bursts (especially keyframes) slightly without exceeding per-frame budget
+			if time.Since(frameStart) < s.maxFramePace && len(s.videoQueue) < cap(s.videoQueue)/2 {
+				time.Sleep(s.paceStep)
+			}
 		}
 
 		s.peersLock.RLock()
@@ -473,7 +645,6 @@ func (s *Sidecar) processVideoRTP() {
 			peer.mu.Lock()
 			active := peer.Active
 			started := peer.Started
-			track := peer.VideoTrack
 
 			if active && !started && isVP8KeyframeStart(pkt.Payload) {
 				peer.Started = true
@@ -483,11 +654,14 @@ func (s *Sidecar) processVideoRTP() {
 
 			peer.mu.Unlock()
 
-			if active && started && track != nil {
-				_ = track.WriteRTP(pkt)
+			if active && started {
+				if peerPkt := cloneRTPPacket(pkt); peerPkt != nil {
+					peer.enqueueVideo(peerPkt)
+				}
 			}
 		}
 		s.peersLock.RUnlock()
+		burstCount++
 	}
 }
 
@@ -511,11 +685,12 @@ func (s *Sidecar) processAudioRTP() {
 			peer.mu.Lock()
 			active := peer.Active
 			started := peer.Started
-			track := peer.AudioTrack
 			peer.mu.Unlock()
 
-			if active && started && track != nil {
-				_ = track.WriteRTP(pkt)
+			if active && started {
+				if peerPkt := cloneRTPPacket(pkt); peerPkt != nil {
+					peer.enqueueAudio(peerPkt)
+				}
 			}
 		}
 		s.peersLock.RUnlock()
@@ -562,12 +737,6 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 		s.peersLock.Unlock()
 	}()
 
-	iceServers := []webrtc.ICEServer{}
-    
-	for _, stun := range getStunServers() {
-		iceServers = append(iceServers, webrtc.ICEServer{URLs: []string{stun}})
-	}
-
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -600,11 +769,32 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 		return "", err
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(i))
+	se := webrtc.SettingEngine{}
+	udpMin := envIntOrDefault("WEBRTC_UDP_MIN", 0)
+	udpMax := envIntOrDefault("WEBRTC_UDP_MAX", 0)
+	if udpMin > 0 && udpMax >= udpMin && udpMax <= 65535 {
+		if err := se.SetEphemeralUDPPortRange(uint16(udpMin), uint16(udpMax)); err != nil {
+			log.Printf("[API] Warning: SetEphemeralUDPPortRange(%d, %d) failed: %v", udpMin, udpMax, err)
+		}
+	}
+	if publicIPs := parseCSVEnv("WEBRTC_PUBLIC_IP"); len(publicIPs) > 0 {
+		se.SetNAT1To1IPs(publicIPs, webrtc.ICECandidateTypeHost)
+	}
 
-	pc, err := api.NewPeerConnection(webrtc.Configuration{
-		ICEServers: iceServers,
-	})
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(i),
+		webrtc.WithSettingEngine(se),
+	)
+
+	cfg := webrtc.Configuration{
+		ICEServers: getIceServers(),
+	}
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("ICE_TRANSPORT_POLICY")), "relay") {
+		cfg.ICETransportPolicy = webrtc.ICETransportPolicyRelay
+	}
+
+	pc, err := api.NewPeerConnection(cfg)
 	if err != nil {
 		return "", fmt.Errorf("create PeerConnection: %w", err)
 	}
@@ -643,6 +833,8 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 		AudioTrack: audioTrack,
 		Active:     false,
 		stopSR:     make(chan struct{}),
+		videoSend:  make(chan *rtp.Packet, envIntOrDefault("PEER_VIDEO_QUEUE_SIZE", 256)),
+		audioSend:  make(chan *rtp.Packet, envIntOrDefault("PEER_AUDIO_QUEUE_SIZE", 256)),
 	}
 
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
@@ -686,11 +878,12 @@ func (s *Sidecar) CreatePeer(id string) (sdp string, err error) {
 	gatherComplete := webrtc.GatheringCompletePromise(pc)
 	<-gatherComplete
 
+	go peer.runVideoSender()
+	go peer.runAudioSender()
+
 	s.peersLock.Lock()
 	if old, exists := s.peers[id]; exists {
-		old.Active = false
-		close(old.stopSR)
-		old.PC.Close()
+		old.Close()
 	}
 	s.peers[id] = peer
 	s.peersLock.Unlock()
@@ -839,9 +1032,7 @@ func (s *Sidecar) AddICECandidate(id string, candidate string, sdpMid string, sd
 func (s *Sidecar) ClosePeer(id string) {
 	s.peersLock.Lock()
 	if peer, exists := s.peers[id]; exists {
-		peer.Active = false
-		close(peer.stopSR)
-		peer.PC.Close()
+		peer.Close()
 		delete(s.peers, id)
 	}
 	s.peersLock.Unlock()
@@ -889,9 +1080,19 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	}
 
 	vBitrate := strings.TrimSpace(bitrate)
-		if vBitrate == "" {
-			vBitrate = envOrDefault("VIDEO_BITRATE", "1500k")
-		}
+	if vBitrate == "" {
+		vBitrate = envOrDefault("VIDEO_BITRATE", "1500k")
+	}
+	vBufsize := strings.TrimSpace(os.Getenv("VIDEO_BUFSIZE"))
+	if vBufsize == "" {
+		vBufsize = vBitrate
+	}
+	gop := envIntOrDefault("VIDEO_GOP", fps*2)
+	if gop < 1 {
+		gop = fps * 2
+	}
+	gopStr := strconv.Itoa(gop)
+	cpuUsed := envOrDefault("VIDEO_CPU_USED", "6")
 	audioDelayMs := envIntOrDefault("AUDIO_DELAY_MS", 0)
 
 	if source != "" {
@@ -907,15 +1108,15 @@ func (s *Sidecar) StartFFmpeg(source string, width int, height int, framerate in
 	args = append(args,
 		"-pix_fmt", "yuv420p",
 		"-c:v", "libvpx",
-		"-cpu-used", "6",
+		"-cpu-used", cpuUsed,
 		"-deadline", "realtime",
 		"-lag-in-frames", "0",
 		"-error-resilient", "1",
 		"-b:v", vBitrate,
 		"-maxrate", vBitrate,
-		"-bufsize", envOrDefault("VIDEO_BUFSIZE", "500k"),
-		"-keyint_min", "15",
-		"-g", "15",
+		"-bufsize", vBufsize,
+		"-keyint_min", gopStr,
+		"-g", gopStr,
 		"-auto-alt-ref", "0",
 		"-payload_type", "96",
 		"-ssrc", "11111111",
@@ -1009,8 +1210,7 @@ func (s *Sidecar) Stop() {
 
 	s.peersLock.Lock()
 	for id, peer := range s.peers {
-		peer.Active = false
-		peer.PC.Close()
+		peer.Close()
 		delete(s.peers, id)
 	}
 	s.peersLock.Unlock()
@@ -1115,7 +1315,7 @@ func main() {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		log.Printf("[API] Setting source: %s (%dx%d @ %dfps)", req.Source, req.Width, req.Height, req.Framerate, req.Bitrate)
+		log.Printf("[API] Setting source: %s (%dx%d @ %dfps, bitrate=%s)", req.Source, req.Width, req.Height, req.Framerate, req.Bitrate)
 		sidecar.StartFFmpeg(req.Source, req.Width, req.Height, req.Framerate, req.Bitrate)
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
