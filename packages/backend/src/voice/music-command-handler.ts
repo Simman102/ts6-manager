@@ -3,6 +3,7 @@ import { VoiceBotManager } from './voice-bot-manager.js';
 import type { VoiceBot } from './voice-bot.js';
 import type { QueueItem } from './playlist/queue.js';
 import { downloadYouTube } from './audio/youtube.js';
+import { unwrapBbCodeUrls } from '../utils/bbcode.js';
 
 const MUSIC_DIR = process.env.MUSIC_DIR || '/data/music';
 const CMD_PREFIX = '!';
@@ -187,7 +188,8 @@ export class MusicCommandHandler {
       return;
     }
 
-    if (!args.startsWith('http://') && !args.startsWith('https://')) {
+    const url = unwrapBbCodeUrls(args);
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
       this.reply(bot, userClid, 'Please provide a valid URL. Usage: !play <url>');
       return;
     }
@@ -195,7 +197,7 @@ export class MusicCommandHandler {
     this.reply(bot, userClid, 'Loading...');
 
     try {
-      const { filePath, info } = await downloadYouTube(args, MUSIC_DIR);
+      const { filePath, info } = await downloadYouTube(url, MUSIC_DIR);
 
       const queueItem: QueueItem = {
         id: `yt_${info.id}`,
@@ -204,7 +206,7 @@ export class MusicCommandHandler {
         duration: info.duration,
         filePath,
         source: 'youtube',
-        sourceUrl: args,
+        sourceUrl: url,
       };
 
       bot.queue.add(queueItem);
@@ -289,7 +291,8 @@ export class MusicCommandHandler {
     }
 
     // URL provided — add to queue without interrupting
-    if (!args.startsWith('http://') && !args.startsWith('https://')) {
+    const url = unwrapBbCodeUrls(args);
+    if (!url.startsWith('http://') && !url.startsWith('https://')) {
       this.reply(bot, userClid, 'Usage: !queue [show|play <n>|remove <n>|clear|<url>]');
       return;
     }
@@ -297,7 +300,7 @@ export class MusicCommandHandler {
     this.reply(bot, userClid, 'Loading...');
 
     try {
-      const { filePath, info } = await downloadYouTube(args, MUSIC_DIR);
+      const { filePath, info } = await downloadYouTube(url, MUSIC_DIR);
 
       const queueItem: QueueItem = {
         id: `yt_${info.id}`,
@@ -306,7 +309,7 @@ export class MusicCommandHandler {
         duration: info.duration,
         filePath,
         source: 'youtube',
-        sourceUrl: args,
+        sourceUrl: url,
       };
 
       bot.queue.add(queueItem);
@@ -409,7 +412,8 @@ export class MusicCommandHandler {
       return;
     }
 
-    const parts = args.split(/\s+/);
+    const cleanedArgs = unwrapBbCodeUrls(args);
+    const parts = cleanedArgs.split(/\s+/);
     const url = parts[0];
     const preset = parts[1] || undefined;
 

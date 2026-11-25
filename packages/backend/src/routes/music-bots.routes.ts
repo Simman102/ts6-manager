@@ -1,8 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { requireRole } from '../middleware/rbac.js';
 import { AppError } from '../middleware/error-handler.js';
+import fs from 'fs';
+import path from 'path';
 import type { VoiceBotManager } from '../voice/voice-bot-manager.js';
 import { downloadYouTube } from '../voice/audio/youtube.js';
+import { validateOpusFile } from '../voice/audio/opus-validator.js';
+import { unwrapBbCodeUrls } from '../utils/bbcode.js';
 import { playerWidgetToken } from './widget-public.routes.js';
 
 export const musicBotRoutes: Router = Router();
@@ -193,12 +197,41 @@ musicBotRoutes.post('/:id/play', async (req: Request, res: Response, next) => {
     const song = await prisma.song.findUnique({ where: { id: parseInt(songId) } });
     if (!song) throw new AppError(404, 'Song not found');
 
+    let filePath = song.filePath;
+    let duration = song.duration ?? undefined;
+
+    if (song.source === 'youtube' && song.sourceUrl) {
+      const fileMissing = !fs.existsSync(filePath);
+      const isOpus = path.extname(filePath).toLowerCase() === '.opus';
+      const check = !fileMissing && isOpus
+        ? await validateOpusFile(filePath, duration)
+        : null;
+
+      if (fileMissing || (check && !check.valid)) {
+        console.warn(
+          `[music-bots.routes] Cached audio invalid for song ${song.id} (${fileMissing ? 'missing' : check?.reason}); re-downloading`,
+        );
+        const redownloaded = await downloadYouTube(song.sourceUrl, MUSIC_DIR);
+        filePath = redownloaded.filePath;
+        duration = redownloaded.info.duration || duration;
+        const stats = fs.statSync(filePath);
+        await prisma.song.update({
+          where: { id: song.id },
+          data: {
+            filePath,
+            fileSize: stats.size,
+            ...(redownloaded.info.duration ? { duration: redownloaded.info.duration } : {}),
+          },
+        });
+      }
+    }
+
     const queueItem = {
       id: String(song.id),
       title: song.title,
       artist: song.artist ?? undefined,
-      duration: song.duration ?? undefined,
-      filePath: song.filePath,
+      duration,
+      filePath,
       source: song.source as 'local' | 'youtube' | 'url',
       sourceUrl: song.sourceUrl ?? undefined,
     };
@@ -218,7 +251,8 @@ musicBotRoutes.post('/:id/play-url', async (req: Request, res: Response, next) =
     const manager: VoiceBotManager = req.app.locals.voiceBotManager;
     const id = parseInt(req.params.id as string);
     const { url } = req.body;
-    if (!url) throw new AppError(400, 'url is required');
+    const cleanUrl = url ? unwrapBbCodeUrls(String(url)) : '';
+    if (!cleanUrl) throw new AppError(400, 'url is required');
 
     const bot = manager.getBot(id);
     if (!bot) throw new AppError(404, 'Music bot not found');
@@ -226,7 +260,7 @@ musicBotRoutes.post('/:id/play-url', async (req: Request, res: Response, next) =
       throw new AppError(400, 'Bot is not connected');
     }
 
-    const { filePath, info } = await downloadYouTube(url, MUSIC_DIR);
+    const { filePath, info } = await downloadYouTube(cleanUrl, MUSIC_DIR);
 
     const queueItem = {
       id: `yt_${info.id}`,
@@ -235,7 +269,7 @@ musicBotRoutes.post('/:id/play-url', async (req: Request, res: Response, next) =
       duration: info.duration,
       filePath,
       source: 'youtube' as const,
-      sourceUrl: url,
+      sourceUrl: cleanUrl,
     };
 
     bot.queue.add(queueItem);

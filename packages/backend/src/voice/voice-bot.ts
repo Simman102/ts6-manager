@@ -367,6 +367,7 @@ export class VoiceBot extends EventEmitter {
 
     this.stopIcyPolling();
     this.stopPlayback();
+    const epoch = this.loopEpoch;
     this._nowPlaying = item;
     this._status = 'playing';
     this.emit('statusChange', this._status);
@@ -375,10 +376,12 @@ export class VoiceBot extends EventEmitter {
 
     try {
       const pcmData = await this.pipeline.toPcm(item.filePath);
+      if (epoch !== this.loopEpoch) return;
       this.pcmFrames = this.pipeline.splitFrames(pcmData);
       this.frameIndex = 0;
       this.startPlaybackLoop();
     } catch (err) {
+      if (epoch !== this.loopEpoch) return;
       this._status = 'connected';
       this._nowPlaying = null;
       this.emit('statusChange', this._status);
